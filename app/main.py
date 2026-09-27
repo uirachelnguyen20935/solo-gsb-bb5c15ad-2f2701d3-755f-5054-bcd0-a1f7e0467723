@@ -19,6 +19,7 @@ from .models import (
     DecisionResponse,
     DominantPathResponse,
     IntegrityResponse,
+    ServiceEdgesResponse,
     ServiceTimeResponse,
     StatsResponse,
 )
@@ -90,6 +91,7 @@ def root() -> dict[str, str]:
         "ingest": "POST /api/v1/spans:batch",
         "decisions": "GET /api/v1/decisions/{trace_id}",
         "service_time": "GET /api/v1/traces/{trace_id}/service-time",
+        "service_edges": "GET /api/v1/traces/{trace_id}/service-edges",
         "concurrency": "GET /api/v1/traces/{trace_id}/concurrency?min_active=2",
         "integrity": "GET /api/v1/traces/{trace_id}/integrity",
         "dominant_path": "GET /api/v1/traces/{trace_id}/dominant-path",
@@ -150,6 +152,19 @@ def get_service_time(trace_id: str) -> ServiceTimeResponse:
     if view is None:
         raise HTTPException(status_code=404, detail="trace not found")
     return ServiceTimeResponse(**view)
+
+
+@app.get(
+    "/api/v1/traces/{trace_id}/service-edges",
+    response_model=ServiceEdgesResponse,
+    tags=["traces"],
+    summary="Direct cross-service call edges of one trace",
+)
+def get_service_edges(trace_id: str) -> ServiceEdgesResponse:
+    view = get_engine().get_service_edges(trace_id)
+    if view is None:
+        raise HTTPException(status_code=404, detail="trace not found")
+    return ServiceEdgesResponse(**view)
 
 
 @app.get(

@@ -149,6 +149,22 @@ class IntegrityResponse(BaseModel):
     anomalies: list[IntegrityAnomaly]
 
 
+class ServiceEdgeEntry(BaseModel):
+    source_service: str
+    target_service: str
+    # Number of direct parent/child relationships aggregated into this edge.
+    call_count: int
+    # Union of the clipped child intervals per parent span, summed across
+    # parent spans (ns).
+    duration_ns: int
+
+
+class ServiceEdgesResponse(BaseModel):
+    trace_id: str
+    span_count: int
+    edges: list[ServiceEdgeEntry]
+
+
 class DominantPathResponse(BaseModel):
     trace_id: str
     span_count: int

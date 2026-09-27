@@ -212,6 +212,52 @@ curl -s http://localhost:8080/api/v1/traces/abc-123/service-time
 `services` is sorted by `exclusive_ns` descending, then service name
 ascending with the `null` group last. Unknown trace id → `404`.
 
+### `GET /api/v1/traces/{trace_id}/service-edges` — cross-service direct calls
+
+Summarizes the direct calls between services in one trace. A parent/child
+relationship becomes an edge only when **the parent span has already
+arrived**, both spans carry a non-empty `service`, and the two services
+differ — so missing-parent spans, self references and same-service hops never
+produce an edge. Edges are aggregated by `(source service, target service)`
+with the number of calls.
+
+Each edge's time is measured **per parent span and per target service**: every
+direct child interval is clipped to its parent's half-open `[start, end)`
+interval, the clipped intervals of children calling the same target service
+are unioned (overlapping siblings count once), and the union lengths are then
+summed across parent spans. Missing parents, self references and zero-length
+intersections contribute no time (a zero-length intersection still counts as a
+call). Works on open traces too — computed from a consistent snapshot of the
+spans received so far.
+
+```bash
+curl -s http://localhost:8080/api/v1/traces/abc-123/service-edges
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "span_count": 4,
+  "edges": [
+    {
+      "source_service": "checkout",
+      "target_service": "payments",
+      "call_count": 2,
+      "duration_ns": 900000000
+    },
+    {
+      "source_service": "payments",
+      "target_service": "payments-db",
+      "call_count": 1,
+      "duration_ns": 500000000
+    }
+  ]
+}
+```
+
+`edges` is sorted by `duration_ns` descending, then source and target service
+name ascending. Unknown trace id → `404`.
+
 ### `GET /api/v1/traces/{trace_id}/concurrency?min_active=2` — concurrent-span windows
 
 Finds the time windows inside one trace where at least `min_active` spans
@@ -455,7 +501,9 @@ pytest -q
 The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
 queries, timestamp formats, per-service exclusive-time computation,
-concurrent-span window detection, trace integrity checks (missing parent,
-self reference, cycles, time-boundary violations), dominant-path selection
-(weights, tie-breaking, missing-parent roots, cycle/self-reference
-rejection) and crash recovery from SQLite.
+cross-service edge aggregation (call counts, per-parent unioned time,
+missing-parent/self-reference/same-service exclusion, zero-length
+intersections, ordering), concurrent-span window detection, trace integrity
+checks (missing parent, self reference, cycles, time-boundary violations),
+dominant-path selection (weights, tie-breaking, missing-parent roots,
+cycle/self-reference rejection) and crash recovery from SQLite.

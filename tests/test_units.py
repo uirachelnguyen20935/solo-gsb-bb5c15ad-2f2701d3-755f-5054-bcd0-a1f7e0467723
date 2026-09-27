@@ -15,6 +15,7 @@ from app.integrity import (
     check_integrity,
 )
 from app.dominantpath import CyclicTraceError, dominant_path
+from app.serviceedges import service_edges
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -603,3 +604,180 @@ def test_dominant_path_self_reference_and_cycle_reported_together():
     assert exc.span_ids == ["a", "b", "loop"]
     assert exc.self_references == ["loop"]
     assert exc.cycles == [["a", "b"]]
+
+
+# ------------------------------------------------------------ service edges
+
+def _edge_map(rows):
+    return {(e["source_service"], e["target_service"]): e
+            for e in service_edges(rows)}
+
+
+def test_service_edges_basic_direct_cross_service_call():
+    rows = [
+        _row("root", 0, 100, service="gateway"),
+        _row("auth", 10, 60, parent="root", service="auth"),
+    ]
+    assert service_edges(rows) == [{
+        "source_service": "gateway",
+        "target_service": "auth",
+        "call_count": 1,
+        "duration_ns": 50,
+    }]
+
+
+def test_service_edges_aggregates_calls_by_service_pair():
+    rows = [
+        _row("root", 0, 100, service="gateway"),
+        _row("a1", 0, 20, parent="root", service="auth"),
+        _row("a2", 80, 100, parent="root", service="auth"),
+    ]
+    edges = service_edges(rows)
+    assert len(edges) == 1
+    assert edges[0]["call_count"] == 2
+    # Per-parent/target: union of [0,20) and [80,100) = 40.
+    assert edges[0]["duration_ns"] == 40
+
+
+def test_service_edges_overlapping_same_target_children_unioned_once():
+    rows = [
+        _row("root", 0, 100, service="gateway"),
+        _row("a1", 10, 60, parent="root", service="auth"),
+        _row("a2", 40, 90, parent="root", service="auth"),
+    ]
+    edge = service_edges(rows)[0]
+    assert edge["call_count"] == 2
+    # Union [10,90) = 80, not 50 + 50 = 100.
+    assert edge["duration_ns"] == 80
+
+
+def test_service_edges_sums_union_length_across_parent_spans():
+    rows = [
+        _row("g1", 0, 100, service="gateway"),
+        _row("a1", 0, 60, parent="g1", service="auth"),
+        _row("g2", 200, 300, service="gateway"),
+        _row("a2", 220, 300, parent="g2", service="auth"),
+    ]
+    edge = service_edges(rows)[0]
+    assert edge["call_count"] == 2
+    # 60 from g1 + 80 from g2: no union across different parent spans.
+    assert edge["duration_ns"] == 140
+
+
+def test_service_edges_same_service_parent_child_is_not_an_edge():
+    rows = [
+        _row("root", 0, 100, service="gateway"),
+        _row("local", 10, 90, parent="root", service="gateway"),
+        # Same-service nested calls stay invisible even across services later.
+        _row("auth", 20, 80, parent="local", service="auth"),
+    ]
+    edges = service_edges(rows)
+    # Only gateway -> auth (from local) survives; gateway -> gateway does not.
+    assert [(e["source_service"], e["target_service"], e["call_count"])
+            for e in edges] == [("gateway", "auth", 1)]
+    assert edges[0]["duration_ns"] == 60
+
+
+def test_service_edges_missing_parent_contributes_nothing():
+    rows = [
+        _row("orphan", 0, 40, parent="ghost", service="auth"),
+        _row("root", 0, 100, service="gateway"),
+        _row("a", 10, 30, parent="root", service="auth"),
+    ]
+    edges = service_edges(rows)
+    assert len(edges) == 1
+    assert (edges[0]["source_service"], edges[0]["target_service"]) == (
+        "gateway", "auth",
+    )
+
+
+def test_service_edges_self_reference_is_not_an_edge():
+    rows = [
+        _row("root", 0, 100, service="gateway"),
+        _row("loop", 10, 20, parent="loop", service="gateway"),
+        _row("auth", 30, 40, parent="root", service="auth"),
+    ]
+    pairs = [(e["source_service"], e["target_service"])
+             for e in service_edges(rows)]
+    assert pairs == [("gateway", "auth")]
+
+
+def test_service_edges_zero_length_intersection_counts_but_no_duration():
+    rows = [
+        _row("root", 100, 200, service="gateway"),
+        # Zero-length child: counts as a call, contributes no time.
+        _row("instant", 150, 150, parent="root", service="auth"),
+        # Child starting exactly where the parent ends: [200, 200) is empty.
+        _row("touch", 200, 250, parent="root", service="billing"),
+        # A real call from the same parent adds time for that target.
+        _row("real", 110, 160, parent="root", service="billing"),
+    ]
+    edges = _edge_map(rows)
+    assert edges[("gateway", "auth")] == {
+        "source_service": "gateway",
+        "target_service": "auth",
+        "call_count": 1,
+        "duration_ns": 0,
+    }
+    # touch + real union inside one parent: [110,160) U [200,200) = 50.
+    assert edges[("gateway", "billing")]["call_count"] == 2
+    assert edges[("gateway", "billing")]["duration_ns"] == 50
+
+
+def test_service_edges_child_outside_parent_is_clipped_to_parent():
+    rows = [
+        _row("root", 10, 50, service="gateway"),
+        _row("wide", 0, 100, parent="root", service="auth"),
+    ]
+    edge = service_edges(rows)[0]
+    assert edge["call_count"] == 1
+    assert edge["duration_ns"] == 40
+
+
+def test_service_edges_empty_service_on_either_end_is_ignored():
+    rows = [
+        _row("root", 0, 100, service=None),
+        _row("a", 10, 40, parent="root", service="auth"),
+        _row("p2", 0, 100, service="gateway"),
+        _row("anon", 50, 80, parent="p2", service=None),
+    ]
+    assert service_edges(rows) == []
+
+
+def test_service_edges_sorted_duration_desc_then_service_names_asc():
+    rows = [
+        _row("g1", 0, 100, service="gateway"),
+        _row("a", 0, 90, parent="g1", service="auth"),      # duration 90
+        _row("b", 0, 60, parent="g1", service="billing"),   # duration 60
+        # Tied at 30 with gateway -> d below; "billing" < "gateway".
+        _row("g2", 0, 100, service="billing"),
+        _row("c", 0, 30, parent="g2", service="catalog"),   # duration 30
+        _row("d", 0, 30, parent="g1", service="db"),        # duration 30
+    ]
+    assert [(e["source_service"], e["target_service"], e["duration_ns"])
+            for e in service_edges(rows)] == [
+        ("gateway", "auth", 90),
+        ("gateway", "billing", 60),
+        ("billing", "catalog", 30),
+        ("gateway", "db", 30),
+    ]
+
+
+def test_service_edges_multi_hop_chain_counts_each_hop():
+    rows = [
+        _row("edge", 0, 100, service="edge"),
+        _row("web", 10, 90, parent="edge", service="web"),
+        _row("api", 20, 80, parent="web", service="api"),
+        _row("db", 30, 70, parent="api", service="db"),
+    ]
+    edges = _edge_map(rows)
+    assert set(edges) == {("edge", "web"), ("web", "api"), ("api", "db")}
+    assert edges[("edge", "web")]["duration_ns"] == 80
+    assert edges[("web", "api")]["duration_ns"] == 60
+    assert edges[("api", "db")]["duration_ns"] == 40
+    assert all(e["call_count"] == 1 for e in edges.values())
+
+
+def test_service_edges_empty_snapshot():
+    assert service_edges([]) == []
+

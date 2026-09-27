@@ -262,6 +262,98 @@ def test_service_time_after_close_handles_null_group_and_overlaps(client):
     ]
 
 
+def test_service_edges_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/service-edges")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_service_edges_open_trace_uses_current_snapshot(client):
+    tid = "se-open"
+    ms = 10**6
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "a", 10, 50, service="auth", parent_span_id="root"),
+    ]})
+
+    resp = client.get(f"/api/v1/traces/{tid}/service-edges")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["span_count"] == 2
+    assert body["edges"] == [{
+        "source_service": "gateway",
+        "target_service": "auth",
+        "call_count": 1,
+        "duration_ns": 40 * ms,
+    }]
+
+    # A later batch extends the consistent snapshot on re-query: a second
+    # gateway -> auth call, overlapping the first within the same parent and
+    # therefore unioned to [10, 90).
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "b", 40, 90, service="auth", parent_span_id="root"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/service-edges").json()
+    assert body["span_count"] == 3
+    assert body["edges"] == [{
+        "source_service": "gateway",
+        "target_service": "auth",
+        "call_count": 2,
+        "duration_ns": 80 * ms,
+    }]
+
+
+def test_service_edges_aggregation_and_filtering_after_close(client):
+    tid = "se-closed"
+    ms = 10**6
+    client.post("/api/v1/spans:batch", json={"spans": [
+        # Two gateway parents calling auth; duration sums per parent.
+        _custom_span(tid, "g1", 0, 100, service="gateway"),
+        _custom_span(tid, "a1", 0, 60, service="auth", parent_span_id="g1"),
+        _custom_span(tid, "g2", 200, 300, service="gateway"),
+        _custom_span(tid, "a2", 220, 300, service="auth",
+                     parent_span_id="g2"),
+        # Same-service hop: not an edge.
+        _custom_span(tid, "g3", 0, 50, service="gateway"),
+        _custom_span(tid, "local", 0, 50, service="gateway",
+                     parent_span_id="g3"),
+        # Missing parent: ignored.
+        _custom_span(tid, "orphan", 0, 10, service="auth",
+                     parent_span_id="ghost"),
+        # Self reference: ignored.
+        _custom_span(tid, "loop", 0, 10, service="auth",
+                     parent_span_id="loop"),
+        # Empty service on the child: ignored.
+        _custom_span(tid, "anon", 0, 10, service=None,
+                     parent_span_id="g1"),
+        # Zero-length intersection: counts as a call but no duration.
+        _custom_span(tid, "touch", 300, 350, service="billing",
+                     parent_span_id="g2"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    resp = client.get(f"/api/v1/traces/{tid}/service-edges")
+    assert resp.status_code == 200
+    edges = resp.json()["edges"]
+    assert resp.json()["span_count"] == 10
+    # gateway -> auth: 60 (g1) + 80 (g2) = 140 ms, sorts first.
+    assert edges == [
+        {
+            "source_service": "gateway",
+            "target_service": "auth",
+            "call_count": 2,
+            "duration_ns": 140 * ms,
+        },
+        {
+            "source_service": "gateway",
+            "target_service": "billing",
+            "call_count": 1,
+            "duration_ns": 0,
+        },
+    ]
+
+
 def test_concurrency_unknown_trace_returns_404(client):
     resp = client.get("/api/v1/traces/no-such-trace/concurrency")
     assert resp.status_code == 404
