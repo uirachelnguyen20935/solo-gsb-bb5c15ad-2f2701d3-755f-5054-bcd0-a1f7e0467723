@@ -339,6 +339,42 @@ Snapshot with problems:
 lists are rotated to start at the smallest span id. Unknown trace id →
 `404`.
 
+### `GET /api/v1/traces/{trace_id}/service-edges` — cross-service call edges
+
+Builds the service-level call graph of one trace from the spans received so
+far. A parent→child pair counts as an edge only when the **parent span has
+arrived**, both spans carry a non-empty `service`, and the two services
+**differ**; qualifying pairs are aggregated by
+`(source_service, target_service)` with a call count. `duration_ns` is
+computed per parent span and target service: each direct child's
+`[start, end)` interval is intersected with the parent's interval, the
+intersections are unioned (overlapping children count once), and the
+per-parent unions are summed across parent spans. Missing parents, self
+references and zero-length intersections contribute no duration (a zero-length
+child still counts as a call). Works on open traces too — computed from a
+consistent snapshot of the spans received so far.
+
+```bash
+curl -s http://localhost:8080/api/v1/traces/abc-123/service-edges
+```
+
+```json
+{
+  "trace_id": "abc-123",
+  "span_count": 4,
+  "edge_count": 2,
+  "edges": [
+    { "source_service": "checkout", "target_service": "payments",
+      "call_count": 2, "duration_ns": 900000000 },
+    { "source_service": "payments", "target_service": "payments-db",
+      "call_count": 1, "duration_ns": 450000000 }
+  ]
+}
+```
+
+`edges` is sorted by `duration_ns` descending, then source/target service
+name ascending. Unknown trace id → `404`.
+
 ### `GET /api/v1/traces/{trace_id}/dominant-path` — heaviest root-to-leaf call chain
 
 Ranks every root-to-leaf parent/child chain of one trace by accumulated
@@ -456,6 +492,7 @@ The test suite covers priority budget saturation, slow/error classification,
 stable-hash fill counts, determinism, duplicate/late span handling, batch
 queries, timestamp formats, per-service exclusive-time computation,
 concurrent-span window detection, trace integrity checks (missing parent,
-self reference, cycles, time-boundary violations), dominant-path selection
-(weights, tie-breaking, missing-parent roots, cycle/self-reference
-rejection) and crash recovery from SQLite.
+self reference, cycles, time-boundary violations), cross-service edge
+aggregation (call counts, per-parent union durations, clipping, sorting),
+dominant-path selection (weights, tie-breaking, missing-parent roots,
+cycle/self-reference rejection) and crash recovery from SQLite.

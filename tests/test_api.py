@@ -468,6 +468,91 @@ def test_integrity_works_after_trace_close(client):
     assert anomaly["start_overflow_ns"] == 0
 
 
+def test_service_edges_unknown_trace_returns_404(client):
+    resp = client.get("/api/v1/traces/no-such-trace/service-edges")
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "trace not found"
+
+
+def test_service_edges_open_trace_follows_snapshot(client):
+    tid = "se-open"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 0, 100, service="gateway"),
+        _custom_span(tid, "a", 10, 50, service="auth", parent_span_id="root"),
+        _custom_span(tid, "b", 20, 40, service="auth", parent_span_id="root"),
+        # Same service as the parent: no edge.
+        _custom_span(tid, "in", 50, 60, service="gateway",
+                     parent_span_id="root"),
+        # Parent never arrived: no edge.
+        _custom_span(tid, "orphan", 0, 10, service="auth",
+                     parent_span_id="ghost"),
+        # Missing service: no edge.
+        _custom_span(tid, "anon", 60, 70, service=None, parent_span_id="root"),
+    ]})
+
+    ms = 10**6
+    resp = client.get(f"/api/v1/traces/{tid}/service-edges")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["trace_id"] == tid
+    assert body["span_count"] == 6
+    # gateway->auth: 2 calls; children [10,50) and [20,40) clipped to root
+    # [0,100) and unioned -> [10,50) = 40ms.
+    assert body["edge_count"] == 1
+    assert body["edges"] == [{
+        "source_service": "gateway",
+        "target_service": "auth",
+        "call_count": 2,
+        "duration_ns": 40 * ms,
+    }]
+
+    # Newly received spans extend the consistent snapshot on re-query.
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "p", 60, 90, service="payments",
+                     parent_span_id="root"),
+        _custom_span(tid, "db", 65, 80, service="payments-db",
+                     parent_span_id="p"),
+    ]})
+    body = client.get(f"/api/v1/traces/{tid}/service-edges").json()
+    assert body["span_count"] == 8
+    assert body["edge_count"] == 3
+    assert body["edges"] == [
+        {"source_service": "gateway", "target_service": "auth",
+         "call_count": 2, "duration_ns": 40 * ms},
+        {"source_service": "gateway", "target_service": "payments",
+         "call_count": 1, "duration_ns": 30 * ms},
+        {"source_service": "payments", "target_service": "payments-db",
+         "call_count": 1, "duration_ns": 15 * ms},
+    ]
+
+
+def test_service_edges_after_close_clips_and_skips_empty_intersections(client):
+    tid = "se-closed"
+    client.post("/api/v1/spans:batch", json={"spans": [
+        _custom_span(tid, "root", 10, 50, service="a"),
+        # Sticks out of the parent: only [10, 50) contributes.
+        _custom_span(tid, "wide", 0, 100, service="b", parent_span_id="root"),
+        # Zero-length span: counts as a call, adds no duration.
+        _custom_span(tid, "instant", 20, 20, service="b",
+                     parent_span_id="root"),
+        # Self reference: ignored entirely.
+        _custom_span(tid, "loop", 30, 40, service="c", parent_span_id="loop"),
+    ]})
+    client.post("/api/v1/admin/force-flush")
+
+    ms = 10**6
+    resp = client.get(f"/api/v1/traces/{tid}/service-edges")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["span_count"] == 4
+    assert body["edges"] == [{
+        "source_service": "a",
+        "target_service": "b",
+        "call_count": 2,
+        "duration_ns": 40 * ms,
+    }]
+
+
 def test_dominant_path_unknown_trace_returns_404(client):
     resp = client.get("/api/v1/traces/no-such-trace/dominant-path")
     assert resp.status_code == 404

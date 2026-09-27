@@ -15,6 +15,7 @@ from app.integrity import (
     check_integrity,
 )
 from app.dominantpath import CyclicTraceError, dominant_path
+from app.serviceedges import service_edges
 from app.models import SpanIn
 from pydantic import ValidationError
 
@@ -603,3 +604,125 @@ def test_dominant_path_self_reference_and_cycle_reported_together():
     assert exc.span_ids == ["a", "b", "loop"]
     assert exc.self_references == ["loop"]
     assert exc.cycles == [["a", "b"]]
+
+
+# ------------------------------------------------------------ service edges
+
+def _edges(rows):
+    return {(e["source_service"], e["target_service"]): e
+            for e in service_edges(rows)}
+
+
+def test_service_edges_empty_snapshot():
+    assert service_edges([]) == []
+
+
+def test_service_edges_basic_cross_service_call():
+    rows = [
+        _row("root", 0, 100, service="frontend"),
+        _row("child", 10, 40, parent="root", service="backend"),
+    ]
+    assert service_edges(rows) == [{
+        "source_service": "frontend",
+        "target_service": "backend",
+        "call_count": 1,
+        "duration_ns": 30,
+    }]
+
+
+def test_service_edges_same_or_missing_service_is_ignored():
+    rows = [
+        _row("root", 0, 100, service="a"),
+        # Same service as the parent: not a cross-service edge.
+        _row("same", 0, 50, parent="root", service="a"),
+        # Child without a service.
+        _row("anon", 0, 50, parent="root", service=None),
+        # Parent without a service.
+        _row("named", 0, 50, parent="anon", service="b"),
+    ]
+    assert service_edges(rows) == []
+
+
+def test_service_edges_missing_parent_and_self_reference_are_ignored():
+    rows = [
+        _row("orphan", 0, 50, parent="ghost", service="b"),
+        _row("loop", 0, 50, parent="loop", service="a"),
+    ]
+    assert service_edges(rows) == []
+
+
+def test_service_edges_overlapping_children_union_once_per_parent():
+    rows = [
+        _row("root", 0, 100, service="a"),
+        _row("c1", 10, 60, parent="root", service="b"),
+        _row("c2", 50, 80, parent="root", service="b"),
+    ]
+    edge = _edges(rows)[("a", "b")]
+    assert edge["call_count"] == 2
+    # Union of [10, 60) and [50, 80) counts the overlap only once.
+    assert edge["duration_ns"] == 70
+
+
+def test_service_edges_union_is_per_target_service():
+    rows = [
+        _row("root", 0, 100, service="a"),
+        _row("c1", 10, 60, parent="root", service="b"),
+        _row("c2", 50, 80, parent="root", service="c"),
+    ]
+    edges = _edges(rows)
+    # The [50, 60) overlap counts towards both edges: unions are per target.
+    assert edges[("a", "b")]["duration_ns"] == 50
+    assert edges[("a", "c")]["duration_ns"] == 30
+
+
+def test_service_edges_child_is_clipped_to_parent_interval():
+    rows = [
+        _row("root", 10, 50, service="a"),
+        _row("wide", 0, 100, parent="root", service="b"),
+    ]
+    assert _edges(rows)[("a", "b")]["duration_ns"] == 40
+
+
+def test_service_edges_zero_length_intersection_adds_no_duration():
+    rows = [
+        _row("root", 0, 100, service="a"),
+        _row("instant", 50, 50, parent="root", service="b"),
+        # Entirely outside the parent interval: empty intersection.
+        _row("outside", 200, 300, parent="root", service="b"),
+    ]
+    edge = _edges(rows)[("a", "b")]
+    # Both calls count towards the edge; neither contributes duration.
+    assert edge["call_count"] == 2
+    assert edge["duration_ns"] == 0
+
+
+def test_service_edges_duration_sums_across_parent_spans():
+    rows = [
+        _row("p1", 0, 100, service="a"),
+        _row("c1", 10, 40, parent="p1", service="b"),
+        _row("p2", 0, 100, service="a"),
+        _row("c2", 10, 40, parent="p2", service="b"),
+    ]
+    edge = _edges(rows)[("a", "b")]
+    assert edge["call_count"] == 2
+    assert edge["duration_ns"] == 60
+
+
+def test_service_edges_sorting_duration_desc_then_names_asc():
+    rows = [
+        _row("r1", 0, 100, service="zsvc"),
+        _row("c1", 0, 20, parent="r1", service="bsvc"),
+        _row("r2", 0, 100, service="asvc"),
+        _row("c2", 0, 20, parent="r2", service="bsvc"),
+        _row("r3", 0, 100, service="msvc"),
+        _row("c3", 0, 90, parent="r3", service="bsvc"),
+    ]
+    result = service_edges(rows)
+    assert [
+        (e["source_service"], e["target_service"], e["duration_ns"])
+        for e in result
+    ] == [
+        ("msvc", "bsvc", 90),
+        ("asvc", "bsvc", 20),   # duration tie: source name ascending
+        ("zsvc", "bsvc", 20),
+    ]

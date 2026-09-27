@@ -23,6 +23,7 @@ from . import concurrency
 from . import dominantpath
 from . import integrity
 from . import sampler
+from . import serviceedges
 from . import servicetime
 from .config import Settings
 from .models import SpanIn
@@ -424,6 +425,25 @@ class SamplingEngine:
                 "anomaly_count": len(anomalies),
                 "valid": not anomalies,
                 "anomalies": anomalies,
+            }
+
+    def get_service_edges(self, tid: str) -> dict[str, Any] | None:
+        """Cross-service direct call edges from one consistent snapshot.
+
+        Works for decided and open traces alike; for open traces the snapshot
+        spans exactly what has been received at query time (the engine lock
+        serializes against ingest). Returns None for unknown traces.
+        """
+        with self._lock:
+            if self.storage.get_trace(tid) is None:
+                return None
+            rows = list(self.storage.iter_span_rows(tid))
+            edges = serviceedges.service_edges(rows)
+            return {
+                "trace_id": tid,
+                "span_count": len(rows),
+                "edge_count": len(edges),
+                "edges": edges,
             }
 
     def get_dominant_path(self, tid: str) -> dict[str, Any] | None:

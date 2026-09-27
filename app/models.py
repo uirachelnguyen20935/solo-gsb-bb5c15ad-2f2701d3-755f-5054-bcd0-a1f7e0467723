@@ -149,6 +149,20 @@ class IntegrityResponse(BaseModel):
     anomalies: list[IntegrityAnomaly]
 
 
+class ServiceEdge(BaseModel):
+    source_service: str
+    target_service: str
+    call_count: int
+    duration_ns: int
+
+
+class ServiceEdgesResponse(BaseModel):
+    trace_id: str
+    span_count: int
+    edge_count: int
+    edges: list[ServiceEdge]
+
+
 class DominantPathResponse(BaseModel):
     trace_id: str
     span_count: int
